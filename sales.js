@@ -12,6 +12,7 @@ AWS.config.update({
 const dynamoClient = new AWS.DynamoDB.DocumentClient();
 const SALES_TABLE_NAME = "sales";
 
+
 // Add or update a sale record
 const addOrUpdateSale = async (saleDetails) => {
     if (!saleDetails.salesId) {

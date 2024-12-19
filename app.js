@@ -2,6 +2,7 @@ const express = require('express');
 require('dotenv').config();
 const multer = require('multer');
 const bodyParser = require('body-parser');
+const AWS = require('aws-sdk'); 
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { getProducts, getProductsById, addOrUpdateProduct, deleteProductsById, uploadImagesToS3 } = require('./dynamo');
 const { addOrUpdateCartItem, getCartByUserEmail, deleteCartItem } = require('./cart');
@@ -13,62 +14,73 @@ const cors = require('cors');
 app.use(cors());
 app.use(express.urlencoded({ extended: true }));
 
+// AWS Cognito Configuration
+const cognito = new AWS.CognitoIdentityServiceProvider({
+    region: 'us-east-1', // Adjust your region as needed
+});
+
+// Helper function to fetch shipping address from Cognito
+const getCognitoUserAttributes = async (email) => {
+    const params = {
+        UserPoolId: process.env.COGNITO_USER_POOL_ID,
+        Filter: `email = "${email}"`,
+    };
+
+    const data = await cognito.listUsers(params).promise();
+    if (!data.Users.length) throw new Error("User not found");
+
+    const attributes = {};
+    data.Users[0].Attributes.forEach(attr => {
+        attributes[attr.Name] = attr.Value;
+    });
+
+    return {
+        name: attributes['name'] || "Customer",
+        shippingAddress: attributes['custom:shippingAddress'] || "N/A",
+    };
+};
+
 // Webhook route
 app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
     const sig = req.headers['stripe-signature'];
     let event;
 
     try {
-        // Verify the webhook signature
         event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
     } catch (err) {
         console.error('Webhook signature verification failed:', err.message);
         return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // Handle the event
-    switch (event.type) {
-        case 'checkout.session.completed':
-            const session = event.data.object;
+    if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
 
-            // Extract shipping details from the session
-            const shippingDetails = session.shipping_details || 'N/A';  // Get the shipping address
-            const shippingMethod = session.shipping_option ? session.shipping_option.display_name : 'N/A';  // Get the shipping method
+        const shippingDetails = session.shipping_details?.address || 'N/A';
+        const lineItems = await stripe.checkout.sessions.listLineItems(session.id);
 
-            // Retrieve the line items from the Stripe session
-            const lineItems = await stripe.checkout.sessions.listLineItems(session.id);
+        const productsSold = lineItems.data.map(item => ({
+            productName: item.description,
+            quantity: item.quantity,
+            price: item.amount_total / 100,
+        }));
 
-            // Extract product information from line items
-            const productsSold = lineItems.data.map(item => ({
-                productName: item.description,
-                quantity: item.quantity,
-                price: item.amount_total / 100  // Stripe returns the price in cents
-            }));
+        const saleDetails = {
+            userEmail: session.customer_email,
+            totalAmount: session.amount_total / 100,
+            currency: session.currency,
+            paymentStatus: 'paid',
+            shippingAddress: shippingDetails,
+            timestamp: new Date().toISOString(),
+            products: productsSold,
+        };
 
-            // Save the sale details to DynamoDB
-            const saleDetails = {
-                userEmail: session.customer_email,  
-                totalAmount: session.amount_total / 100,  
-                currency: session.currency,
-                paymentStatus: 'paid',
-                shippingAddress: shippingDetails.address || 'N/A',  
-                shippingMethod: shippingMethod || 'N/A',
-                timestamp: new Date().toISOString(),
-                products: productsSold  
-            };
-
-            try {
-                await addOrUpdateSale(saleDetails);  
-            } catch (err) {
-                console.error('Error recording sale:', err);
-            }
-            break;
-
-        default:
-            console.log(`Unhandled event type: ${event.type}`);
+        try {
+            await addOrUpdateSale(saleDetails);
+        } catch (err) {
+            console.error('Error recording sale:', err);
+        }
     }
 
-    // Send a response to Stripe to acknowledge receipt of the event
     res.json({ received: true });
 });
 
@@ -254,85 +266,53 @@ app.get('/sales', async (req, res) => {
 
 // Stripe Checkout Session creation
 app.post('/create-checkout-session', async (req, res) => {
-    const { cartItems, shippingDetails, totalPrice, customerEmail } = req.body;  // Extract customerEmail
+    const { cartItems, customerEmail } = req.body;
 
     try {
-        // Build line items for Stripe Checkout
-        const lineItems = cartItems.map(item => {
-            return {
-                price_data: {
-                    currency: 'cad',  // Set the currency to CAD for Canadian dollars
-                    product_data: {
-                        name: item.productName,
-                    },
-                    unit_amount: ((Math.round(item.price * 100)* 0.13)+(Math.round(item.price * 100))) ,  // Stripe requires the price in cents
+        // Fetch user attributes from Cognito
+        const { name, shippingAddress } = await getCognitoUserAttributes(customerEmail);
+
+        // Create customer in Stripe
+        const customer = await stripe.customers.create({
+            email: customerEmail,
+            name: name,
+            shipping: {
+                name: name,
+                address: {
+                    line1: shippingAddress,
+                    country: 'CA',
                 },
-                quantity: item.quantity,
-            };
+            },
         });
 
-        // Create the checkout session
+        // Build line items for Stripe Checkout
+        const lineItems = cartItems.map(item => ({
+            price_data: {
+                currency: 'cad',
+                product_data: { name: item.productName },
+                unit_amount: Math.round((item.price + item.price * 0.13) * 100),
+            },
+            quantity: item.quantity,
+        }));
+
+        // Create Stripe Checkout session
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
             line_items: lineItems,
             mode: 'payment',
-            success_url: `${process.env.FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,  // Success URL on frontend
-            cancel_url: `${process.env.FRONTEND_URL}/cancel`,  // Cancel URL on frontend
-            customer_email: customerEmail,  // Use the logged-in user's email
-            shipping_address_collection: {
-                allowed_countries: ['CA', 'US']  // Set allowed countries for shipping
-            },
-            shipping_options: [
-                {
-                    shipping_rate_data: {
-                        type: 'fixed_amount',
-                        fixed_amount: {
-                            amount: 0, 
-                            currency: 'cad',
-                        },
-                        display_name: 'Standard shipping',
-                        delivery_estimate: {
-                            minimum: {
-                                unit: 'business_day',
-                                value: 5,
-                            },
-                            maximum: {
-                                unit: 'business_day',
-                                value: 7,
-                            },
-                        },
-                    },
-                },
-                {
-                    shipping_rate_data: {
-                        type: 'fixed_amount',
-                        fixed_amount: {
-                            amount: 1500, 
-                            currency: 'cad',
-                        },
-                        display_name: 'Expedited shipping',
-                        delivery_estimate: {
-                            minimum: {
-                                unit: 'business_day',
-                                value: 1,
-                            },
-                            maximum: {
-                                unit: 'business_day',
-                                value: 3,
-                            },
-                        },
-                    },
-                },
-            ],
+            customer: customer.id,
+            success_url: `${process.env.FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${process.env.FRONTEND_URL}/cancel`,
+            shipping_address_collection: { allowed_countries: ['CA', 'US'] },
         });
 
-        // Send the session ID and URL to the frontend
         res.json({ id: session.id, url: session.url });
     } catch (error) {
-        console.error('Error creating Stripe session:', error);  // Log the error to the console
+        console.error('Error creating Stripe session:', error);
         res.status(500).json({ error: 'Failed to create Stripe session' });
     }
 });
+
 
 
 
